@@ -1,0 +1,30 @@
+[project]
+name = "npc-analysis"
+version = "0.1.0"
+description = "NPC proxy fidelity analyzer for IBM quantum hardware"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "qiskit>=2.3.1",
+    "qiskit-ibm-runtime>=0.46.1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=9.0.3"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "zensical>=0.0.33",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
