@@ -45,7 +45,7 @@ If either `t1` or `t2` is `None` (rare, but possible when a backend reports inco
 
 ## SWAP (Mini-NPC)
 
-SWAPs are not treated as a single gate — they're decomposed into their full native gate sequence (typically 3 native 2q gates + interleaving single-qubit gates). When the walker sees the 3rd swap-tagged native 2q gate, it runs a "mini-NPC":
+SWAPs are not treated as a single gate — they're decomposed into their full native gate sequence (typically 3 native 2q gates + interleaving single-qubit gates). When the walker reaches the **last op of a swap segment** (the highest `step_index` among the segment's tagged ops, normally the 3rd native 2q gate), it runs a "mini-NPC":
 
 1. Walk **physical qubit i** through the full SWAP segment (every 1q + 2q op touching qubit $i$), applying depolarizing + thermal relaxation per gate.
 2. Walk **physical qubit j** independently through the same segment.

@@ -41,6 +41,7 @@ sequenceDiagram
     PM->>TC: Pass: BasisTranslator<br/>→ SWAPs decomposed to native gates
     PM->>TC: Final pass<br/>→ updates final circuit
     Note over TC: final = fully decomposed ISA circuit
+    Note over TC: transpile_layout rebuilt from<br/>dag + property_set every pass
 ```
 
 **What each captured artifact contains:**
@@ -50,8 +51,9 @@ sequenceDiagram
 | `routed` | Mix of original + `swap` | Explicit `swap` instructions | SwapTracker (oracle) |
 | `final` | Native only (`cz`, `sx`, `rz`, ...) | 3× native 2q gates | SwapTracker (main walk) |
 | `layout` | N/A | N/A | SwapTracker (initial mapping fallback) |
+| `transpile_layout` | N/A | N/A | `final_index_layout()` → NPCAnalyzer layout tripwire |
 
-`TranspileCapture.initial_index_layout()` mirrors Qiskit's `TranspileLayout.initial_index_layout(filter_ancillas=True)` for the raw `Layout` object — only the user's input qubits are returned, ancillas are filtered out.
+`TranspileCapture.initial_index_layout()` mirrors Qiskit's `TranspileLayout.initial_index_layout(filter_ancillas=True)` for the raw `Layout` object — only the user's input qubits are returned, ancillas are filtered out. `final_index_layout()` delegates to the captured `TranspileLayout` for the post-routing layout used by the tripwire (`dag_to_circuit` does not attach a `TranspileLayout` to `final`, so it is recorded separately as `transpile_layout`).
 
 ## Phase 2: SWAP Tracking
 
@@ -90,7 +92,7 @@ flowchart TD
 | Field | Example | Purpose |
 |-------|---------|---------|
 | `path` | `[0, 1, 2, 3, 4, 3]` | Physical locations over time |
-| `ops` | List of `{name, qubits, step_index, is_swap_gate, is_virtual}` | Full gate history |
+| `ops` | List of `{name, qubits, step_index, is_swap_gate, is_virtual}` (swap-tagged ops also gain `swap_segment_index`) | Full gate history |
 | `swap_segments` | `[{phys_i: 2, phys_j: 3, all_ops: [...]}]` | Native gate sequences per SWAP |
 | `meas_error` | `0.0123` | Readout error at final location |
 
@@ -159,7 +161,7 @@ graph LR
     C --> D["JSON output"]
 ```
 
-Before assembling the result, `analyze()` runs a **layout tripwire**: it compares the tracker's final per-qubit locations against `cap.final.layout.final_index_layout(filter_ancillas=True)`. A mismatch raises `AssertionError`, because pulling readout / T1 / T2 from the wrong physical qubit would silently produce wrong fidelity numbers.
+Before assembling the result, `analyze()` runs a **layout tripwire**: it compares the tracker's final per-qubit locations against an expected final layout from Qiskit's `TranspileLayout` — the `expected_final_layout` that `analyze_circuit` passes from the real transpiled output, or, when `NPCAnalyzer` is driven directly, `cap.final_index_layout()` (the `TranspileLayout` recorded during the callback). A mismatch raises `AssertionError`, because pulling readout / T1 / T2 from the wrong physical qubit would silently produce wrong fidelity numbers.
 
 The final JSON looks like:
 

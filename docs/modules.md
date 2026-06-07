@@ -4,7 +4,7 @@ All modules live under `src/npc_analysis/` and the public ones are re-exported f
 
 | Module | Exports | Purpose |
 |--------|---------|---------|
-| `callback.py` | `TranspileCapture` | Pass-manager callback that snapshots routed + final circuits + layout |
+| `callback.py` | `TranspileCapture` | Pass-manager callback that snapshots routed + final circuits, the property-set layout, and the authoritative `TranspileLayout` |
 | `swap_tracker.py` | `SwapTracker` | Classify gates as SWAP/real and track each qubit's physical trajectory |
 | `qinfo.py` | `Qinfo` | Per-logical-qubit state container |
 | `gate_calibration.py` | `GateCalibration` | Per-gate calibration + depolarizing probability |
@@ -24,7 +24,20 @@ After every compiler pass the callback:
 
 1. Snapshots the **routed circuit** if the pass is `FilterOpNodes` (SWAPs still explicit at this point).
 2. Updates the **final circuit** from the current DAG on every invocation.
-3. Captures `property_set["layout"]` whenever it appears.
+3. Captures `property_set["layout"]` whenever it appears (stored as `layout`).
+4. Rebuilds the authoritative `TranspileLayout` via `TranspileLayout.from_property_set(dag, property_set)` on every invocation and keeps the latest non-`None` result as `transpile_layout`.
+
+Step 4 exists because `dag_to_circuit` does **not** attach a `TranspileLayout` to the circuits captured here — so `final_index_layout()` (used for the analyzer's layout tripwire) reads from this separately-recorded `transpile_layout` rather than from `final.layout`.
+
+### Captured fields
+
+| Field | Type | Contents |
+|-------|------|----------|
+| `input_circuit` | `QuantumCircuit \| None` | The user's original circuit (passed in) |
+| `routed` | `QuantumCircuit \| None` | Circuit after routing — SWAPs still explicit |
+| `final` | `QuantumCircuit \| None` | Fully decomposed ISA circuit |
+| `layout` | `Layout \| None` | Raw `property_set["layout"]` mapping |
+| `transpile_layout` | `TranspileLayout \| None` | Authoritative layout for the final logical→physical check |
 
 ### Construction
 
@@ -39,6 +52,10 @@ You **must** pass `input_circuit` — `initial_index_layout()` uses it to distin
 Returns `[p_for_v0, p_for_v1, ...]` for the user's original qubits — mirrors `TranspileLayout.initial_index_layout(filter_ancillas=True)` on the bare `Layout` object.
 
 Only `filter_ancillas=True` is implemented; passing `False` raises `NotImplementedError`.
+
+### `final_index_layout(filter_ancillas=True) → list[int]`
+
+Returns the **final** logical→physical array (after all routing SWAPs) by delegating to the captured `TranspileLayout.final_index_layout(...)`. Raises `RuntimeError` if no `TranspileLayout` was captured (i.e. the pass manager never finished). `NPCAnalyzer` uses this as the ground-truth for its layout tripwire when no explicit `expected_final_layout` is supplied.
 
 ---
 
@@ -73,7 +90,17 @@ When a native 2q gate is encountered in the final circuit:
 1. Both involved logical qubits increment `pending_2q_count`.
 2. `_check_swap()` asks: is the oracle's next op `"swap"`?
 3. If yes and `pending_2q_count >= 3` for both qubits, verify the last 3 native 2q gates were on the same physical pair in the same order.
-4. On confirmation: tag all ops in the step range as `is_swap_gate=True`, build a swap segment containing every 1q + 2q op in the range, update qubit locations, append to `path`.
+4. On confirmation (`track()` does the rest): bound the SWAP window, tag its ops, build a swap segment for each logical qubit, update qubit locations, and append the new location to each `path`.
+
+### Segment construction (on confirmation)
+
+When `_check_swap()` returns `True`, `track()`:
+
+1. **Bounds the window** to the last 3 native 2q gates on `v_c` whose `swap_segment_index` is still unset (`candidate_czs` → `cz_steps`). Filtering to *unassigned* native 2q gates keeps an earlier SWAP's gates from being pulled into this one when a qubit also has pending real 2q traffic; if no unassigned native 2q gates remain it raises `RuntimeError`.
+2. **Tags** every still-untagged op in `[first_step, last_step]` for both logical qubits via `_tag_swap_segment()`, setting `is_swap_gate=True` and a per-`Qinfo` `swap_segment_index`.
+3. **Decrements** `pending_2q_count` by 3 on both qubits.
+4. **Builds a `swap_segments` entry** per qubit via `collect_segment_ops()`: the tagged ops from *both* logical qubits are merged, de-duplicated by `(step_index, qubits)`, and sorted by `step_index`. Each segment records `phys_i`/`phys_j` as the **low/high** physical index of the swapped pair (`min`/`max`, not control/target order).
+5. **Updates locations**: swaps `location` and the `p_contains` mapping for both qubits and appends the new physical to each `path`.
 
 ### `track() → SwapTracker`
 
@@ -81,7 +108,7 @@ Runs the full classification pass; returns `self` for chaining.
 
 ### `to_dict()`
 
-Returns `{"native_2q_gate", "initial_layout", "final_v_to_p", "qubits", "qubit_calibrations", "gate_calibrations"}`. The calibration sub-dicts are populated lazily — `to_dict()` first ensures every physical qubit on the initial layout or in any `Qinfo.location` has a cached `QubitCalibration`.
+Returns `{"native_2q_gate", "initial_layout", "final_v_to_p", "qubits", "qubit_calibrations", "gate_calibrations"}`. `final_v_to_p` and `qubits` are restricted to the user's logical qubits (`v < n_logical`); the idle/ancilla `Qinfo` entries the tracker keeps internally are excluded. The calibration sub-dicts are populated lazily — `to_dict()` first ensures every physical qubit on the initial layout or in any `Qinfo.location` has a cached `QubitCalibration`.
 
 ---
 
@@ -168,9 +195,11 @@ Builds a walker from a tracker's calibration caches. Tops up the `QubitCalibrati
 Processes operations in order:
 
 - **Regular gate**: apply depolarizing then thermal relaxation
-- **SWAP segments**: emit a `SwapNoiseEvent` once the 3rd swap-tagged 2q gate is seen; walk both physical qubits through the full native sequence via `_run_swap_mini_npc()` and set `f = (f_i + f_j) / 2`
+- **SWAP segments**: each swap-tagged op carries a `swap_segment_index`; the mini-NPC fires once, when the segment's **last** op is reached (`step_index == max step in the segment`) and segments are applied strictly in order (`next_swap_segment`). It walks both physical qubits through the full native sequence via `_run_swap_mini_npc()`, sets `f = (f_i + f_j) / 2`, emits a `SwapNoiseEvent`, and advances `path_idx`.
 - **Measure**: apply readout error
 - **Virtual gates**: skipped (unless they're tagged `is_swap_gate`, in which case they participate in the mini-NPC walk)
+
+After the walk, `walk_qubit` asserts its bookkeeping: every `swap_segments` entry was applied, `path_idx` landed on the last path index, and the walked `current_physical` equals `qi.location` — any mismatch raises `RuntimeError` rather than returning a silently wrong fidelity.
 
 ### `walk_circuit(quantuminfo, n_logical) → CircuitFidelityResult`
 
@@ -222,24 +251,30 @@ Emitted per confirmed SWAP.
 
 | Field | Description |
 |-------|-------------|
-| `physical_qubits` | The two physical qubits involved (`(phys_i, phys_j)`) |
+| `physical_qubits` | The two physical qubits involved (`(phys_i, phys_j)`, low/high) |
 | `native_ops` | Full list of native gates in the SWAP segment |
 | `f_before` | Fidelity entering the SWAP |
 | `f_phys_i`, `f_phys_j` | Fidelity of each physical qubit after the native sequence |
 | `f_after` | Average: `(f_phys_i + f_phys_j) / 2` |
+| `swap_segment_index` | Index of this segment within the qubit's `swap_segments` |
+| `trigger_step` | `step_index` of the op that triggered the mini-NPC (the segment's last step) |
+
+`swap_segment_index` and `trigger_step` exist for ordering/debugging and are **not** emitted in the JSON output (`_event_to_dict` omits them).
 
 ---
 
 ## npc_analyzer.py — NPCAnalyzer, NPCResult, analyze_circuit
 
-### `NPCAnalyzer(backend, capture, output_path=None)`
+### `NPCAnalyzer(backend, capture, output_path=None, expected_final_layout=None)`
 
 Validates that `capture.routed` and `capture.final` are populated (raises `ValueError` otherwise). `output_path` may be `str` or `Path`; the parent directory is created on write.
+
+`expected_final_layout` is the ground-truth final logical→physical layout for the tripwire (below). When omitted, `analyze()` falls back to `capture.final_index_layout()`. `analyze_circuit` always supplies it explicitly from the real transpiled output.
 
 ### `NPCAnalyzer.analyze() → NPCResult`
 
 1. Build `SwapTracker` from capture's routed + final circuits and call `.track()`.
-2. **Layout tripwire**: compare tracker's final per-qubit locations against `cap.final.layout.final_index_layout(filter_ancillas=True)`. Raise `AssertionError` on mismatch.
+2. **Layout tripwire**: compare tracker's final per-qubit locations against `_expected_final_layout()` — the explicit `expected_final_layout` if given, else `capture.final_index_layout()` (which reads the captured `TranspileLayout`). Raise `AssertionError` on mismatch.
 3. Build `FidelityWalker.from_swap_tracker(tracker, trace=True)`.
 4. Compute `walker.walk_circuit(tracker.quantuminfo, tracker.n_logical)`.
 5. Merge tracker metadata + fidelity results into `NPCResult`.
@@ -264,7 +299,9 @@ Methods: `to_dict()` (JSON-ready, stringifies int keys), `to_json(indent=2)`.
 
 ### `analyze_circuit(backend, circuit, *, output_path=None, optimization_level=0) → NPCResult`
 
-One-shot helper. Defaults to `optimization_level=0` because the proxy assumes intact SWAP boundaries — higher levels can fold 1-qubit gates across SWAPs and break the oracle's invariants.
+One-shot helper. Transpiles `circuit` with `generate_preset_pass_manager` (capturing via `TranspileCapture`), then reads the **real** transpiled output's `out.layout.final_index_layout(filter_ancillas=True)` and passes it to `NPCAnalyzer` as `expected_final_layout` — so the tripwire checks the tracker against Qiskit's own final layout. Raises `RuntimeError` if `out.layout` is missing.
+
+Defaults to `optimization_level=0` because the proxy assumes intact SWAP boundaries — higher levels can fold 1-qubit gates across SWAPs and break the oracle's invariants.
 
 ---
 

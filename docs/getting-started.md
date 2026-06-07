@@ -87,6 +87,9 @@ After `pm.run()` completes, the capture holds:
 | `cap.routed` | Circuit after routing — SWAP gates are explicit `swap` instructions |
 | `cap.final` | Fully decomposed ISA circuit — native gates only (e.g. `cz`, `sx`, `rz`) |
 | `cap.layout` | The virtual→physical mapping captured from `property_set["layout"]` |
+| `cap.transpile_layout` | The authoritative `TranspileLayout`; `cap.final_index_layout()` reads it for the analyzer's layout tripwire |
+
+`cap.final` carries no `TranspileLayout` of its own (the callback builds it with `dag_to_circuit`), which is why the capture records `transpile_layout` separately.
 
 ## Reading the Result
 
@@ -120,6 +123,11 @@ print(result.to_json())
 
 ## Layout Tripwire
 
-`NPCAnalyzer.analyze()` compares the `SwapTracker`'s final qubit locations against `cap.final.layout.final_index_layout()` and raises `AssertionError` if they disagree. A mismatch means readout / T1 / T2 would be pulled from the wrong physical qubits — surfacing the bug loudly is preferable to silently bad fidelity numbers.
+`NPCAnalyzer.analyze()` compares the `SwapTracker`'s final qubit locations against an expected final layout drawn from Qiskit's `TranspileLayout`, and raises `AssertionError` if they disagree. A mismatch means readout / T1 / T2 would be pulled from the wrong physical qubits — surfacing the bug loudly is preferable to silently bad fidelity numbers.
+
+The expected layout comes from one of two places:
+
+- **`analyze_circuit` (Option A)** passes the *real* transpiled output's `out.layout.final_index_layout(filter_ancillas=True)` straight into `NPCAnalyzer(expected_final_layout=...)`.
+- **Direct `NPCAnalyzer` use (Option B)** leaves `expected_final_layout=None`, so `analyze()` falls back to `cap.final_index_layout()` — which reads the `TranspileLayout` the callback recorded during `pm.run()`. (Reading `cap.final.layout` would not work: `dag_to_circuit` leaves the captured circuit without a `TranspileLayout`.)
 
 If you see this assertion, your transpiler configuration is likely folding gates across SWAP boundaries; drop `optimization_level` back to `0` and rerun.
