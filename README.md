@@ -10,7 +10,6 @@
   <img src="https://img.shields.io/badge/runtime-qiskit--ibm--runtime-052FAD.svg" alt="qiskit-ibm-runtime">
   <img src="https://img.shields.io/badge/managed%20with-uv-DE5FE9.svg" alt="managed with uv">
   <img src="https://img.shields.io/badge/tests-pytest-0A9EDC.svg" alt="pytest">
-  <img src="https://img.shields.io/badge/status-research-orange.svg" alt="status: research">
 </p>
 
 **ProxyFidelity** (package: `npc_analysis`) predicts per-qubit and circuit-level
